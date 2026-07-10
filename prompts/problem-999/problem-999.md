@@ -1,0 +1,14 @@
+# Problem 999: Alternating Recurrence
+
+There is a unique sequence of integers $a_n$ such that
+
+- $a_1=a_2=a_3=1$, $a_4=2$;
+- $a_n^2 = a\_{n+2}a\_{n-2} + u\cdot a\_{n+1}a\_{n-1}$, where $u=1$ if $n$ is even and $u=2$ if $n$ is odd.
+
+For example, $a\_{13} = 23321$ and $a\_{1003} \equiv 231906014 \pmod{1234567891}$.
+
+For $n = 10^{18} + 3$, find $a_n \bmod 1234567891$.
+
+---
+
+[Source: projecteuler.net/problem=999](https://projecteuler.net/problem=999)
