@@ -1,0 +1,45 @@
+# Your harness config for `solve` (validated working 2026-07-10).
+#
+#   uv run python solve config.yaml prompts/problem-1 prompts/problem-2 ...
+#
+# sonnet + opus  -> claude image (different --model)
+# sol            -> codex image (default model gpt-5.6-sol)
+#
+# Auth is shared from your host logins via `mounts` (your ANTHROPIC/OPENAI env
+# vars aren't set — you log in via OAuth — so we mount the config dirs instead).
+
+runtime: podman
+
+prompt: |
+  Solve the following Project Euler problem. Any referenced data files are in
+  the assets/ directory next to you (paths in the statement are relative).
+  Write your solution code and the final answer to answer.txt in the current
+  directory, with the numeric answer on the last line.
+
+  ---
+  {problem}
+
+defaults:
+  timeout: 1800
+  # No network: none -> harnesses need internet to reach their model APIs.
+
+harnesses:
+  - name: sonnet
+    image: euler-harness/claude:latest
+    cmd: "claude --model sonnet -p {prompt} --dangerously-skip-permissions"
+    mounts:
+      - "~/.claude:/root/.claude"
+      - "~/.claude.json:/root/.claude.json"
+
+  - name: opus
+    image: euler-harness/claude:latest
+    cmd: "claude --model opus -p {prompt} --dangerously-skip-permissions"
+    mounts:
+      - "~/.claude:/root/.claude"
+      - "~/.claude.json:/root/.claude.json"
+
+  - name: sol
+    image: euler-harness/codex:latest
+    cmd: "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox {prompt}"
+    mounts:
+      - "~/.codex/auth.json:/root/.codex/auth.json"

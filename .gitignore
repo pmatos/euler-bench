@@ -1,0 +1,7 @@
+# solve run outputs
+/runs/
+# uv / python
+/.venv/
+__pycache__/
+*.pyc
+uv.lock

@@ -1,0 +1,74 @@
+# Example harness config for `solve`.
+#
+#   uv run python solve config.example.yaml prompts/problem-3 prompts/problem-98
+#
+# Each problem folder is copied into a fresh work dir that is bind-mounted at
+# /work inside the container. The composed prompt (below, with {problem}
+# filled in) is written to /work/PROMPT.txt and passed to the harness.
+#
+# Auth is SHARED FROM YOUR HOST, not configured inside the images: each harness
+# bind-mounts the host's existing CLI config/credentials via `mounts`. Build the
+# images first (see README / harnesses/*/Dockerfile).
+
+# Container runtime: docker (default) or podman. Rootless podman needs no
+# daemon/group setup and writes output files back owned by you.
+runtime: podman
+
+# The prompt every harness receives. Placeholders filled per problem:
+#   {problem}       full problem-statement markdown (inlined here)
+#   {problem_file}  path to the statement file inside the container
+#   {assets_dir}    path to the assets dir inside the container
+prompt: |
+  Solve the following Project Euler problem. Any referenced data files are in
+  the assets/ directory next to you (paths in the statement are relative).
+  Write your solution code and the final answer to answer.txt in the current
+  directory, with the numeric answer on the last line.
+
+  ---
+  {problem}
+
+# Defaults applied to every harness (per-harness keys override scalars and
+# concatenate for the env / mounts / docker_args lists).
+defaults:
+  timeout: 1800        # seconds per run; omit or set null for no limit
+  # No `network:` key -> the runtime's default network (with internet). The
+  # harnesses need to reach their model APIs, so do NOT set network: none here.
+  # SELinux hosts: append ",Z" to each mount mode, e.g. ...:/root/.claude:rw,Z
+
+harnesses:
+  # HOME inside every image is /root, so host config mounts target /root/...
+  #
+  # cmd placeholders (shlex-split first, so {prompt} stays a single arg):
+  #   {prompt} {prompt_file} (/work/PROMPT.txt) {problem_file} {workdir} (/work)
+  #
+  # mounts: "HOST:CONTAINER[:MODE]" — HOST expands ~ and $VARS; MODE ro|rw
+  # (default rw so the CLIs can refresh OAuth tokens; use -j 1 to avoid races
+  # on the shared, mutable auth/state).
+
+  - name: claude
+    image: euler-harness/claude:latest
+    cmd: "claude -p {prompt} --dangerously-skip-permissions"
+    mounts:
+      - "~/.claude:/root/.claude"
+      - "~/.claude.json:/root/.claude.json"
+
+  - name: codex
+    image: euler-harness/codex:latest
+    cmd: "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox {prompt}"
+    mounts:
+      - "~/.codex/auth.json:/root/.codex/auth.json"
+      # - "~/.codex/config.toml:/root/.codex/config.toml:ro"  # host config.toml may reference host paths/MCP servers
+
+  - name: oh-my-pi
+    image: euler-harness/oh-my-pi:latest
+    cmd: "omp -p {prompt} --auto-approve --no-session"
+    mounts:
+      - "~/.omp:/root/.omp"
+    env: [GEMINI_API_KEY]   # forward whatever provider key your omp model uses
+
+  # Alternative: API-key auth instead of mounting a login. Forward host env
+  # vars into the container with `env:` (nothing is written to host config):
+  # - name: claude-apikey
+  #   image: euler-harness/claude:latest
+  #   cmd: "claude -p {prompt} --dangerously-skip-permissions"
+  #   env: [ANTHROPIC_API_KEY]

@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""Run Project Euler problem prompts through containerized solver harnesses.
+
+Usage:
+    uv run python solve config.yaml <problem-dir> [<problem-dir> ...] [options]
+
+For each problem folder and each harness defined in the config, a fresh work
+directory is created (a copy of the problem folder + the composed prompt), and
+the harness is run inside a Docker container with only that folder bind-mounted
+at /work. Output, exit status and timing are captured on the host.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
+
+CONTAINER_WORKDIR = "/work"
+
+
+def die(msg: str) -> "NoReturn":  # type: ignore[name-defined]
+    print(f"solve: error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Harness:
+    name: str
+    image: str
+    cmd: str
+    env: list[str] = field(default_factory=list)
+    mounts: list[str] = field(default_factory=list)
+    docker_args: list[str] = field(default_factory=list)
+    timeout: float | None = None
+    network: str | None = None
+
+
+@dataclass
+class Config:
+    prompt: str
+    harnesses: list[Harness]
+    runtime: str = "docker"
+
+
+def _as_list(value, what: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        die(f"{what} must be a list of strings")
+    return list(value)
+
+
+def load_config(path: Path) -> Config:
+    try:
+        raw = yaml.safe_load(path.read_text())
+    except FileNotFoundError:
+        die(f"config file not found: {path}")
+    except yaml.YAMLError as exc:
+        die(f"could not parse YAML config {path}: {exc}")
+
+    if not isinstance(raw, dict):
+        die("config must be a YAML mapping with 'prompt' and 'harnesses'")
+
+    prompt = raw.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        die("config must define a non-empty string 'prompt'")
+
+    runtime = raw.get("runtime", "docker")
+    if not isinstance(runtime, str) or not runtime.strip():
+        die("'runtime' must be a string (e.g. docker or podman)")
+
+    defaults = raw.get("defaults") or {}
+    if not isinstance(defaults, dict):
+        die("'defaults' must be a mapping")
+
+    harnesses_raw = raw.get("harnesses")
+    if not isinstance(harnesses_raw, list) or not harnesses_raw:
+        die("config must define a non-empty list 'harnesses'")
+
+    harnesses: list[Harness] = []
+    seen: set[str] = set()
+    for i, h in enumerate(harnesses_raw):
+        if not isinstance(h, dict):
+            die(f"harnesses[{i}] must be a mapping")
+        name = h.get("name")
+        if not isinstance(name, str) or not name.strip():
+            die(f"harnesses[{i}] must have a string 'name'")
+        if name in seen:
+            die(f"duplicate harness name: {name}")
+        seen.add(name)
+        image = h.get("image")
+        if not isinstance(image, str) or not image.strip():
+            die(f"harness '{name}' must have a string 'image'")
+        cmd = h.get("cmd")
+        if not isinstance(cmd, str) or not cmd.strip():
+            die(f"harness '{name}' must have a non-empty string 'cmd'")
+
+        # defaults + per-harness merge: scalars override, lists concatenate.
+        timeout = h.get("timeout", defaults.get("timeout"))
+        if timeout is not None and not isinstance(timeout, (int, float)):
+            die(f"harness '{name}': timeout must be a number of seconds")
+        network = h.get("network", defaults.get("network"))
+        if network is not None and not isinstance(network, str):
+            die(f"harness '{name}': network must be a string")
+
+        env = _as_list(defaults.get("env"), "defaults.env") + _as_list(h.get("env"), f"harness '{name}' env")
+        mounts = _as_list(defaults.get("mounts"), "defaults.mounts") + _as_list(
+            h.get("mounts"), f"harness '{name}' mounts"
+        )
+        docker_args = _as_list(defaults.get("docker_args"), "defaults.docker_args") + _as_list(
+            h.get("docker_args"), f"harness '{name}' docker_args"
+        )
+
+        harnesses.append(
+            Harness(
+                name=name,
+                image=image,
+                cmd=cmd,
+                env=list(dict.fromkeys(env)),  # dedupe, preserve order
+                mounts=list(dict.fromkeys(mounts)),
+                docker_args=docker_args,
+                timeout=float(timeout) if timeout else None,
+                network=network,
+            )
+        )
+
+    return Config(prompt=prompt, harnesses=harnesses, runtime=runtime)
+
+
+# --------------------------------------------------------------------------- #
+# Problem resolution
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Problem:
+    name: str
+    dir: Path
+    md: Path
+
+
+def resolve_problem(arg: str) -> Problem:
+    p = Path(arg)
+    if p.is_file() and p.suffix == ".md":
+        return Problem(name=p.parent.name, dir=p.parent, md=p)
+    if not p.is_dir():
+        die(f"problem path is not a directory (or .md file): {arg}")
+
+    preferred = p / f"{p.name}.md"
+    if preferred.is_file():
+        md = preferred
+    else:
+        mds = sorted(p.glob("*.md"))
+        if not mds:
+            die(f"no markdown statement found in {arg}")
+        if len(mds) > 1:
+            die(f"multiple .md files in {arg}; expected one problem statement")
+        md = mds[0]
+    return Problem(name=p.name, dir=p, md=md)
+
+
+# --------------------------------------------------------------------------- #
+# Prompt + work dir
+# --------------------------------------------------------------------------- #
+
+def compose_prompt(template: str, problem: Problem) -> str:
+    """Fill the config prompt template with problem-specific values.
+
+    {problem}       -> full problem-statement markdown
+    {problem_file}  -> path to the statement inside the container
+    {assets_dir}    -> path to the assets dir inside the container
+    """
+    container_md = f"{CONTAINER_WORKDIR}/{problem.md.name}"
+    replacements = {
+        "{problem}": problem.md.read_text(),
+        "{problem_file}": container_md,
+        "{assets_dir}": f"{CONTAINER_WORKDIR}/assets",
+    }
+    out = template
+    for token, value in replacements.items():
+        out = out.replace(token, value)
+    return out
+
+
+def prepare_workdir(work: Path, problem: Problem, prompt_text: str) -> None:
+    if work.exists():
+        shutil.rmtree(work)
+    # Copy the whole problem folder (statement + assets + anything else).
+    shutil.copytree(problem.dir, work)
+    (work / "PROMPT.txt").write_text(prompt_text)
+
+
+# --------------------------------------------------------------------------- #
+# Docker command
+# --------------------------------------------------------------------------- #
+
+def render_cmd(template: str, prompt_text: str, problem: Problem) -> list[str]:
+    """shlex-split the harness cmd, then substitute placeholders per token so a
+    multi-word {prompt} stays a single argv element."""
+    container_md = f"{CONTAINER_WORKDIR}/{problem.md.name}"
+    subs = {
+        "{prompt}": prompt_text,
+        "{prompt_file}": f"{CONTAINER_WORKDIR}/PROMPT.txt",
+        "{problem_file}": container_md,
+        "{workdir}": CONTAINER_WORKDIR,
+    }
+    tokens = shlex.split(template)
+    rendered = []
+    for tok in tokens:
+        for token, value in subs.items():
+            tok = tok.replace(token, value)
+        rendered.append(tok)
+    return rendered
+
+
+def sanitize_name(*parts: str) -> str:
+    raw = "-".join(parts)
+    cleaned = re.sub(r"[^a-zA-Z0-9_.-]", "-", raw)
+    return cleaned[:120].strip("-") or "run"
+
+
+def parse_mount(spec: str) -> tuple[str, str, str | None]:
+    """Parse a HOST:CONTAINER[:MODE] mount spec, expanding ~ and $VARs in HOST."""
+    parts = spec.split(":")
+    if len(parts) == 2:
+        host, container, mode = parts[0], parts[1], None
+    elif len(parts) == 3:
+        host, container, mode = parts[0], parts[1], parts[2]
+    else:
+        die(f"invalid mount spec (expected HOST:CONTAINER[:MODE]): {spec}")
+    host = os.path.abspath(os.path.expanduser(os.path.expandvars(host)))
+    return host, container, mode
+
+
+def build_run_argv(runtime: str, harness: Harness, host_work: Path, container_name: str,
+                   cmd_argv: list[str]) -> tuple[list[str], list[str]]:
+    argv = [runtime, "run", "--rm", "--name", container_name,
+            "-v", f"{host_work.resolve()}:{CONTAINER_WORKDIR}", "-w", CONTAINER_WORKDIR]
+    if harness.network:
+        argv += ["--network", harness.network]
+    forwarded = []
+    for var in harness.env:
+        if var in os.environ:
+            argv += ["-e", var]
+            forwarded.append(var)
+        else:
+            print(f"solve: warning: env var '{var}' not set on host; not forwarded to "
+                  f"'{harness.name}'", file=sys.stderr)
+    for spec in harness.mounts:
+        host, container, mode = parse_mount(spec)
+        if not os.path.exists(host):
+            print(f"solve: warning: mount source '{host}' does not exist; "
+                  f"skipping for '{harness.name}'", file=sys.stderr)
+            continue
+        argv += ["-v", f"{host}:{container}" + (f":{mode}" if mode else "")]
+    argv += harness.docker_args
+    argv += [harness.image]
+    argv += cmd_argv
+    return argv, forwarded
+
+
+def resolve_runtime(cli_runtime: str | None, cfg: Config) -> str:
+    return cli_runtime or cfg.runtime
+
+
+# --------------------------------------------------------------------------- #
+# Run
+# --------------------------------------------------------------------------- #
+
+def run_one(problem: Problem, harness: Harness, run_root: Path, cfg: Config,
+            dry_run: bool) -> dict:
+    base = run_root / problem.name / harness.name
+    work = base / "work"
+    prompt_text = compose_prompt(cfg.prompt, problem)
+    prepare_workdir(work, problem, prompt_text)
+
+    cmd_argv = render_cmd(harness.cmd, prompt_text, problem)
+    container_name = sanitize_name("euler", run_root.name, problem.name, harness.name)
+    run_argv, forwarded = build_run_argv(cfg.runtime, harness, work, container_name, cmd_argv)
+
+    meta = {
+        "problem": problem.name,
+        "problem_dir": str(problem.dir),
+        "harness": harness.name,
+        "runtime": cfg.runtime,
+        "image": harness.image,
+        "container_name": container_name,
+        "cmd": cmd_argv,
+        "run_argv": run_argv,
+        "env_forwarded": forwarded,
+        "prompt_file": f"{CONTAINER_WORKDIR}/PROMPT.txt",
+        "problem_file": f"{CONTAINER_WORKDIR}/{problem.md.name}",
+        "timeout": harness.timeout,
+        "network": harness.network,
+    }
+
+    label = f"[{problem.name} / {harness.name}]"
+    if dry_run:
+        print(f"{label} DRY-RUN\n  work: {work}\n  cmd:  {shlex.join(run_argv)}\n")
+        meta["dry_run"] = True
+        (base / "meta.json").write_text(json.dumps(meta, indent=2))
+        return meta
+
+    print(f"{label} running: {harness.image}")
+    log_path = base / "output.log"
+    started = time.time()
+    meta["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(started))
+    timed_out = False
+    with open(log_path, "wb") as log:
+        try:
+            proc = subprocess.run(
+                run_argv,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=harness.timeout,
+            )
+            exit_code = proc.returncode
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            exit_code = None
+            subprocess.run([cfg.runtime, "rm", "-f", container_name],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            log.write(f"\n\nsolve: killed after timeout of {harness.timeout}s\n".encode())
+        except FileNotFoundError:
+            die(f"{cfg.runtime} not found on PATH")
+
+    finished = time.time()
+    meta["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(finished))
+    meta["duration_sec"] = round(finished - started, 3)
+    meta["exit_code"] = exit_code
+    meta["timed_out"] = timed_out
+    (base / "meta.json").write_text(json.dumps(meta, indent=2))
+
+    status = "TIMEOUT" if timed_out else ("ok" if exit_code == 0 else f"exit {exit_code}")
+    print(f"{label} done in {meta['duration_sec']}s: {status}")
+    return meta
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="solve",
+        description="Run Project Euler problems through containerized solver harnesses.",
+    )
+    parser.add_argument("config", type=Path, help="path to the YAML harness config")
+    parser.add_argument("problems", nargs="+", help="problem folder paths (e.g. prompts/problem-3)")
+    parser.add_argument("--harness", action="append", metavar="NAME",
+                        help="only run the named harness (repeatable); default: all in config")
+    parser.add_argument("--runtime", metavar="BIN",
+                        help="container runtime, e.g. docker or podman "
+                             "(overrides config 'runtime'; default: docker)")
+    parser.add_argument("--runs-dir", type=Path, default=Path("runs"),
+                        help="root directory for run outputs (default: ./runs)")
+    parser.add_argument("--jobs", "-j", type=int, default=1,
+                        help="number of containers to run concurrently (default: 1)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="prepare work dirs and print docker commands without running them")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+
+    cfg = load_config(args.config)
+    cfg.runtime = resolve_runtime(args.runtime, cfg)
+
+    if not args.dry_run and shutil.which(cfg.runtime) is None:
+        die(f"{cfg.runtime} not found on PATH (use --dry-run to inspect commands)")
+
+    harnesses = cfg.harnesses
+    if args.harness:
+        wanted = set(args.harness)
+        harnesses = [h for h in cfg.harnesses if h.name in wanted]
+        missing = wanted - {h.name for h in cfg.harnesses}
+        if missing:
+            die(f"unknown harness(es): {', '.join(sorted(missing))}")
+        if not harnesses:
+            die("no harnesses selected")
+
+    problems = [resolve_problem(p) for p in args.problems]
+
+    run_root = args.runs_dir / time.strftime("%Y%m%d-%H%M%S")
+    run_root.mkdir(parents=True, exist_ok=True)
+    print(f"Run root: {run_root}")
+    print(f"Runtime: {cfg.runtime}")
+    print(f"Problems: {', '.join(p.name for p in problems)}")
+    print(f"Harnesses: {', '.join(h.name for h in harnesses)}\n")
+
+    jobs = [(p, h) for p in problems for h in harnesses]
+    results: list[dict] = []
+    if args.jobs > 1 and not args.dry_run:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            futures = [pool.submit(run_one, p, h, run_root, cfg, args.dry_run) for p, h in jobs]
+            for fut in concurrent.futures.as_completed(futures):
+                results.append(fut.result())
+    else:
+        for p, h in jobs:
+            results.append(run_one(p, h, run_root, cfg, args.dry_run))
+
+    if not args.dry_run:
+        ok = sum(1 for r in results if r.get("exit_code") == 0)
+        summary = {"run_root": str(run_root), "total": len(results), "ok": ok, "results": results}
+        (run_root / "summary.json").write_text(json.dumps(summary, indent=2))
+        print(f"\nSummary: {ok}/{len(results)} runs exited 0  ->  {run_root}/summary.json")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
