@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "language": {
+      "type": "string",
+      "description": "Main programming language of the solution (e.g. python, rust, c)"
+    },
+    "commands": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Ordered shell commands, run from the work directory with bash -e, that build (if needed) and run the solution; the last one prints the answer to stdout"
+    }
+  },
+  "required": ["language", "commands"],
+  "additionalProperties": false
+}

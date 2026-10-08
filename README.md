@@ -74,21 +74,33 @@ For every `(problem × harness)` pair, `solve`:
 3. Runs `docker run --rm -v <work>:/work -w /work <image> <cmd>`.
 4. Captures combined stdout+stderr to `output.log` and writes `meta.json`
    (command, exit code, duration, timeout status). Anything the solver writes
-   into `/work` (e.g. `answer.txt`, solution code) stays in `work/`.
+   into `/work` (solution code) stays in `work/`.
 
-5. Extracts the schema-validated answer into `<harness>/code/`: `solution.<ext>`,
-   `answer.json`, `assets/` (if any) and a `README.md` with the build/run commands
-   (e.g. `python3 solution.py`, or `gcc -O2 -o solution solution.c -lm` then
-   `./solution`). Regenerate for an existing run with
+5. Parses the agent's structured reply (`schemas/solution.schema.json`):
+   `{"language": ..., "commands": [...]}`. The reply holds no code. The agent
+   writes its solution (one file or a whole project) in `/work` and lists the
+   shell commands that build and run it.
+6. **Verifies** by running those commands (`bash -e`, from `/work`) in a fresh
+   container of the same image. Output goes to `verify.log`; the last line
+   printed to stdout is recorded as the answer. Timeout: `verify_timeout`
+   (default 600s).
+7. Collects `<harness>/code/`: the agent's files (minus `PROMPT.txt` and the
+   statement), `assets/`, `run.sh`, `solution.json` and a `README.md` with the
+   commands. Regenerate for an existing run with
    `uv run python codeout.py <run_root>/<problem>/<harness>`.
 
-A `summary.json` is written at the run root. Correctness is **not** graded.
+**A run succeeds** when the agent exits 0 *and* the verification commands exit 0
+(`success` in `meta.json`, counted in `summary.json`). The answer is not
+checked for correctness. Verification runs in the work dir as the agent left it,
+so leftover build artifacts can mask a missing build step. Use
+`compare.py <run_root>/<problem>` to see all harnesses side by side.
 
 **Forcing the language:** set `language: c` in the config or pass `--language c`
 (CLI wins). A requirement is prepended to the prompt, and `meta.json` records
 `language_mismatch` (with a warning) if the model answers in another language.
-The harness image needs that language's toolchain for the agent to test its code
-(the claude image ships only `python3`).
+The images ship `build-essential` (gcc, g++, make) next to `python3`; other
+toolchains (rust, go, ...) must be added to the Dockerfiles, otherwise the agent
+cannot test its code and verification fails.
 
 ### Config
 
@@ -102,7 +114,8 @@ prompt: |
   {problem}                 # replaced with the problem-statement markdown
 
 defaults:                   # optional; per-harness keys override / extend these
-  timeout: 1800             # seconds per run (null = no limit)
+  timeout: 1800             # seconds per agent run (null = no limit)
+  # verify_timeout: 600     # seconds for the verification commands
   # network: bridge         # --network value; leave unset for internet access
 
 harnesses:

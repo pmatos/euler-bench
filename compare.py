@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Compare structured answers across harnesses for one problem run.
+"""Compare solutions across harnesses for one problem run.
 
-Reads each harness's schema-validated final answer (schemas/answer.schema.json:
-{language, answer, code}) and prints a side-by-side table, so results from
-different harnesses/models are comparable without depending on file-writing
-conventions.
+Reads each harness's schema-validated final reply (schemas/solution.schema.json:
+{language, commands}) plus the verification result recorded by `solve` in
+meta.json, and prints a side-by-side table. A harness succeeded when its
+commands exited 0 in the verification container; the answer shown is the last
+line they printed.
 
 Usage:
     uv run python compare.py <run_root>/<problem-dir>
@@ -18,19 +19,25 @@ import json
 import sys
 from pathlib import Path
 
-REQUIRED_FIELDS = ("language", "answer", "code")
+REQUIRED_FIELDS = ("language", "commands")
 
 
 def validate(obj) -> list[str]:
-    """Return schema-violation messages for obj against answer.schema.json (empty if valid)."""
+    """Return schema-violation messages for obj against solution.schema.json (empty if valid)."""
     if not isinstance(obj, dict):
         return ["not a JSON object"]
     errors = []
     for key in REQUIRED_FIELDS:
         if key not in obj:
             errors.append(f"missing '{key}'")
-        elif not isinstance(obj[key], str):
-            errors.append(f"'{key}' is not a string")
+    if "language" in obj and not isinstance(obj["language"], str):
+        errors.append("'language' is not a string")
+    cmds = obj.get("commands")
+    if "commands" in obj:
+        if not isinstance(cmds, list) or not all(isinstance(c, str) for c in cmds):
+            errors.append("'commands' is not a list of strings")
+        elif not cmds:
+            errors.append("'commands' is empty")
     extra = set(obj) - set(REQUIRED_FIELDS)
     if extra:
         errors.append(f"unexpected field(s): {', '.join(sorted(extra))}")
@@ -123,16 +130,31 @@ def main(argv: list[str]) -> int:
     for h in harness_dirs:
         answer, source = load_answer(h)
         if answer is None:
-            rows.append((h.name, "-", "-", "-", source))
+            rows.append((h.name, "-", "no reply", "-", source))
             continue
         errors = validate(answer)
-        language = answer.get("language", "?") if isinstance(answer, dict) else "?"
-        value = answer.get("answer", "?") if isinstance(answer, dict) else "?"
-        code_len = f"{len(answer.get('code', ''))} chars" if isinstance(answer, dict) else "-"
-        status = source if not errors else f"{source} [SCHEMA ERROR: {'; '.join(errors)}]"
-        rows.append((h.name, language, value, code_len, status))
+        if errors:
+            rows.append((h.name, "-", "invalid reply", "-",
+                         f"{source} [SCHEMA ERROR: {'; '.join(errors)}]"))
+            continue
+        verify = None
+        meta = h / "meta.json"
+        if meta.is_file():
+            try:
+                verify = json.loads(meta.read_text()).get("verify")
+            except json.JSONDecodeError:
+                pass
+        if not verify:
+            status, value = "not verified", "-"
+        elif verify.get("timed_out"):
+            status, value = "timeout", "-"
+        elif verify.get("exit_code") == 0:
+            status, value = "ok", verify.get("answer") or "-"
+        else:
+            status, value = f"exit {verify.get('exit_code')}", "-"
+        rows.append((h.name, answer["language"], status, value, source))
 
-    header = ("harness", "language", "answer", "code", "source")
+    header = ("harness", "language", "run", "answer", "source")
     widths = [max(len(str(r[i])) for r in [header, *rows]) for i in range(len(header))]
 
     def fmt(row) -> str:
@@ -143,13 +165,13 @@ def main(argv: list[str]) -> int:
     for row in rows:
         print(fmt(row))
 
-    answers = {r[2] for r in rows if r[2] != "-"}
+    answers = {r[3] for r in rows if r[2] == "ok" and r[3] != "-"}
     if len(answers) > 1:
         print(f"\nMISMATCH: harnesses disagree on the answer: {sorted(answers)}")
     elif len(answers) == 1:
         print(f"\nAll harnesses with an answer agree: {next(iter(answers))}")
     else:
-        print("\nNo harness produced a parseable structured answer.")
+        print("\nNo harness produced a successful run with an answer.")
 
     return 0
 

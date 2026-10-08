@@ -10,7 +10,7 @@ FROM docker.io/library/node:22-bookworm-slim
 ARG CODEX_VERSION=0.144.1
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      git ca-certificates python3 \
+      git ca-certificates python3 build-essential \
  && rm -rf /var/lib/apt/lists/* \
  && npm install -g @openai/codex@${CODEX_VERSION}
 
