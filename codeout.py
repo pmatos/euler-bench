@@ -8,7 +8,6 @@ For a harness run directory (<run_root>/<problem>/<harness>/) this writes:
        result.json and build/dependency dirs>
       assets/          (if the problem has data files)
       solve-run.sh     the agent's commands, as a runnable script
-      solve-reply.json the agent's structured reply {language, commands}
       README.md        how to run it, plus the verification result if known
                        (an agent-written README.md is kept as README.agent.md)
 
@@ -19,51 +18,16 @@ For a harness run directory (<run_root>/<problem>/<harness>/) this writes:
 
 from __future__ import annotations
 
-import json
-import re
 import shutil
 import sys
 from pathlib import Path
 
-from compare import load_answer, validate
-
-ALIASES = {
-    "py": "python", "python3": "python",
-    "cpp": "c++", "cxx": "c++", "cc": "c++",
-    "rs": "rust",
-    "golang": "go",
-    "js": "javascript", "node": "javascript", "nodejs": "javascript",
-    "ts": "typescript",
-    "rb": "ruby",
-    "hs": "haskell",
-    "sh": "bash", "shell": "bash",
-}
-
-
-KNOWN = {"python", "c", "c++", "rust", "go", "java", "javascript", "typescript", "ruby",
-         "haskell", "julia", "lua", "bash", "kotlin", "swift", "scala", "ocaml"}
-
-
-def canonical_language(name: str) -> str:
-    """Normalise a language name; version suffixes (python3, c++17) are dropped
-    only when the remainder is a known language."""
-    key = re.sub(r"\s+", " ", name.strip().lower())
-    base = ALIASES.get(key, key)
-    if base in KNOWN:
-        return base
-    stripped = re.sub(r"[\s_-]*\d+(\.\d+)*$", "", key)
-    stripped = ALIASES.get(stripped, stripped)
-    return stripped if stripped in KNOWN else base
+from reply import load_meta, load_valid_answer
 
 
 def statement_name(harness_dir: Path) -> str:
-    meta = harness_dir / "meta.json"
-    if meta.is_file():
-        try:
-            return Path(json.loads(meta.read_text())["problem_file"]).name
-        except (json.JSONDecodeError, KeyError, TypeError):
-            pass
-    return f"{harness_dir.parent.name}.md"
+    problem_file = load_meta(harness_dir).get("problem_file")
+    return Path(problem_file).name if problem_file else f"{harness_dir.parent.name}.md"
 
 
 def render_script(commands: list[str]) -> str:
@@ -82,17 +46,9 @@ def render_readme(title: str, answer: dict, verify: dict | None) -> str:
     return "\n".join(lines)
 
 
-def write_code_dir(harness_dir: Path, verify: dict | None = None
-                   ) -> tuple[Path | None, dict | None, str]:
-    """Write <harness_dir>/code/. Returns (code_dir, answer, note); code_dir is None on failure."""
+def write_code_dir(harness_dir: Path, answer: dict, verify: dict | None = None) -> Path:
+    """Write <harness_dir>/code/ for an already-validated reply and return its path."""
     harness_dir = harness_dir.resolve()
-    answer, source = load_answer(harness_dir)
-    if answer is None:
-        return None, None, source
-    errors = validate(answer)
-    if errors:
-        return None, answer, f"{source} [SCHEMA ERROR: {'; '.join(errors)}]"
-
     work = harness_dir / "work"
     code_dir = harness_dir / "code"
     if code_dir.exists():
@@ -108,14 +64,13 @@ def write_code_dir(harness_dir: Path, verify: dict | None = None
 
     if (code_dir / "README.md").exists():
         (code_dir / "README.md").rename(code_dir / "README.agent.md")
-    (code_dir / "solve-reply.json").write_text(json.dumps(answer, indent=2) + "\n")
     run_sh = code_dir / "solve-run.sh"
     run_sh.write_text(render_script(answer["commands"]))
     run_sh.chmod(0o755)
     (code_dir / "README.md").write_text(
         render_readme(f"{harness_dir.parent.name} / {harness_dir.name}", answer, verify)
     )
-    return code_dir, answer, source
+    return code_dir
 
 
 def main(argv: list[str]) -> int:
@@ -129,19 +84,13 @@ def main(argv: list[str]) -> int:
             print(f"codeout: not a directory: {arg}", file=sys.stderr)
             status = 1
             continue
-        verify = None
-        meta = harness_dir / "meta.json"
-        if meta.is_file():
-            try:
-                verify = json.loads(meta.read_text()).get("verify")
-            except json.JSONDecodeError:
-                print(f"codeout: {arg}: ignoring unreadable meta.json", file=sys.stderr)
-        code_dir, _, note = write_code_dir(harness_dir, verify)
-        if code_dir is None:
+        answer, note = load_valid_answer(harness_dir)
+        if answer is None:
             print(f"codeout: {arg}: no code extracted ({note})", file=sys.stderr)
             status = 1
-        else:
-            print(f"{arg}: wrote {code_dir}")
+            continue
+        code_dir = write_code_dir(harness_dir, answer, load_meta(harness_dir).get("verify"))
+        print(f"{arg}: wrote {code_dir}")
     return status
 
 

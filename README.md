@@ -85,7 +85,7 @@ For every `(problem × harness)` pair, `solve`:
    printed to stdout is recorded as the answer. Timeout: `verify_timeout`
    (default 600s).
 7. Collects `<harness>/code/`: the agent's files (minus `PROMPT.txt` and the
-   statement), `assets/`, `solve-run.sh`, `solve-reply.json` and a `README.md` with the
+   statement), `assets/`, `solve-run.sh` and a `README.md` with the
    commands. Regenerate for an existing run with
    `uv run python codeout.py <run_root>/<problem>/<harness>`.
 
