@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "properties": {
+    "language": {
+      "type": "string",
+      "description": "Programming language of the solution (e.g. python, rust, c)"
+    },
+    "answer": {
+      "type": "string",
+      "description": "The final numeric answer to the problem, as a string"
+    },
+    "code": {
+      "type": "string",
+      "description": "Complete, self-contained solution source code that produces the answer"
+    }
+  },
+  "required": ["language", "answer", "code"],
+  "additionalProperties": false
+}

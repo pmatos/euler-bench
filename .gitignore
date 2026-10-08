@@ -5,3 +5,7 @@
 __pycache__/
 *.pyc
 uv.lock
+
+# personal harness configs
+/config.yaml
+/haiku-only.yaml
