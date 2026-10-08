@@ -14,6 +14,9 @@
 # daemon/group setup and writes output files back owned by you.
 runtime: podman
 
+# Optional: force the solution language (also: --language on the CLI).
+# language: python
+
 # The prompt every harness receives. Placeholders filled per problem:
 #   {problem}       full problem-statement markdown (inlined here)
 #   {problem_file}  path to the statement file inside the container

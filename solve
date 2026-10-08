@@ -27,6 +27,8 @@ from pathlib import Path
 
 import yaml
 
+from codeout import canonical_language, write_code_dir
+
 CONTAINER_WORKDIR = "/work"
 
 
@@ -56,6 +58,7 @@ class Config:
     prompt: str
     harnesses: list[Harness]
     runtime: str = "docker"
+    language: str | None = None
 
 
 def _as_list(value, what: str) -> list[str]:
@@ -84,6 +87,10 @@ def load_config(path: Path) -> Config:
     runtime = raw.get("runtime", "docker")
     if not isinstance(runtime, str) or not runtime.strip():
         die("'runtime' must be a string (e.g. docker or podman)")
+
+    language = raw.get("language")
+    if language is not None and (not isinstance(language, str) or not language.strip()):
+        die("'language' must be a non-empty string (e.g. python, c, rust)")
 
     defaults = raw.get("defaults") or {}
     if not isinstance(defaults, dict):
@@ -140,7 +147,7 @@ def load_config(path: Path) -> Config:
             )
         )
 
-    return Config(prompt=prompt, harnesses=harnesses, runtime=runtime)
+    return Config(prompt=prompt, harnesses=harnesses, runtime=runtime, language=language)
 
 
 # --------------------------------------------------------------------------- #
@@ -178,12 +185,14 @@ def resolve_problem(arg: str) -> Problem:
 # Prompt + work dir
 # --------------------------------------------------------------------------- #
 
-def compose_prompt(template: str, problem: Problem) -> str:
+def compose_prompt(template: str, problem: Problem, language: str | None = None) -> str:
     """Fill the config prompt template with problem-specific values.
 
     {problem}       -> full problem-statement markdown
     {problem_file}  -> path to the statement inside the container
     {assets_dir}    -> path to the assets dir inside the container
+
+    When `language` is set, a requirement to use it is prepended.
     """
     container_md = f"{CONTAINER_WORKDIR}/{problem.md.name}"
     replacements = {
@@ -194,6 +203,9 @@ def compose_prompt(template: str, problem: Problem) -> str:
     out = template
     for token, value in replacements.items():
         out = out.replace(token, value)
+    if language:
+        out = (f"You MUST write the solution in {language}. Use no other language, and set "
+               f"the \"language\" field of your final answer to \"{language}\".\n\n") + out
     return out
 
 
@@ -286,7 +298,7 @@ def run_one(problem: Problem, harness: Harness, run_root: Path, cfg: Config,
             dry_run: bool) -> dict:
     base = run_root / problem.name / harness.name
     work = base / "work"
-    prompt_text = compose_prompt(cfg.prompt, problem)
+    prompt_text = compose_prompt(cfg.prompt, problem, cfg.language)
     prepare_workdir(work, problem, prompt_text)
 
     cmd_argv = render_cmd(harness.cmd, prompt_text, problem)
@@ -307,6 +319,7 @@ def run_one(problem: Problem, harness: Harness, run_root: Path, cfg: Config,
         "problem_file": f"{CONTAINER_WORKDIR}/{problem.md.name}",
         "timeout": harness.timeout,
         "network": harness.network,
+        "forced_language": cfg.language,
     }
 
     label = f"[{problem.name} / {harness.name}]"
@@ -344,10 +357,27 @@ def run_one(problem: Problem, harness: Harness, run_root: Path, cfg: Config,
     meta["duration_sec"] = round(finished - started, 3)
     meta["exit_code"] = exit_code
     meta["timed_out"] = timed_out
+
+    code_dir, answer, note = write_code_dir(base)
+    meta["code_dir"] = str(code_dir) if code_dir else None
+    if answer is not None:
+        meta["language"] = answer.get("language")
+        meta["answer"] = answer.get("answer")
+    mismatch = False
+    if cfg.language and answer is not None and isinstance(answer.get("language"), str):
+        mismatch = canonical_language(answer["language"]) != canonical_language(cfg.language)
+    meta["language_mismatch"] = mismatch
     (base / "meta.json").write_text(json.dumps(meta, indent=2))
 
     status = "TIMEOUT" if timed_out else ("ok" if exit_code == 0 else f"exit {exit_code}")
     print(f"{label} done in {meta['duration_sec']}s: {status}")
+    if code_dir:
+        print(f"{label} code: {code_dir}")
+    else:
+        print(f"{label} no code extracted ({note})")
+    if mismatch:
+        print(f"{label} warning: asked for {cfg.language}, got {answer['language']}",
+              file=sys.stderr)
     return meta
 
 
@@ -363,6 +393,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--runtime", metavar="BIN",
                         help="container runtime, e.g. docker or podman "
                              "(overrides config 'runtime'; default: docker)")
+    parser.add_argument("--language", metavar="LANG",
+                        help="force the solution language, e.g. python, c, c++, rust "
+                             "(overrides config 'language'; default: model's choice)")
     parser.add_argument("--runs-dir", type=Path, default=Path("runs"),
                         help="root directory for run outputs (default: ./runs)")
     parser.add_argument("--jobs", "-j", type=int, default=1,
@@ -377,6 +410,7 @@ def main(argv: list[str]) -> int:
 
     cfg = load_config(args.config)
     cfg.runtime = resolve_runtime(args.runtime, cfg)
+    cfg.language = args.language or cfg.language
 
     if not args.dry_run and shutil.which(cfg.runtime) is None:
         die(f"{cfg.runtime} not found on PATH (use --dry-run to inspect commands)")
@@ -397,6 +431,7 @@ def main(argv: list[str]) -> int:
     run_root.mkdir(parents=True, exist_ok=True)
     print(f"Run root: {run_root}")
     print(f"Runtime: {cfg.runtime}")
+    print(f"Language: {cfg.language or '(model choice)'}")
     print(f"Problems: {', '.join(p.name for p in problems)}")
     print(f"Harnesses: {', '.join(h.name for h in harnesses)}\n")
 

@@ -60,6 +60,7 @@ Options:
 | `--runtime BIN` | container runtime (`docker` or `podman`); overrides config `runtime` |
 | `--runs-dir DIR` | output root (default `./runs`) |
 | `-j, --jobs N` | run up to N containers concurrently (default 1) |
+| `--language LANG` | force the solution language (python, c, c++, rust, go, java, …); overrides config `language` |
 | `--dry-run` | assemble work dirs and print the `docker run` commands without executing |
 
 ### What happens per run
@@ -75,7 +76,19 @@ For every `(problem × harness)` pair, `solve`:
    (command, exit code, duration, timeout status). Anything the solver writes
    into `/work` (e.g. `answer.txt`, solution code) stays in `work/`.
 
+5. Extracts the schema-validated answer into `<harness>/code/`: `solution.<ext>`,
+   `answer.json`, `assets/` (if any) and a `README.md` with the build/run commands
+   (e.g. `python3 solution.py`, or `gcc -O2 -o solution solution.c -lm` then
+   `./solution`). Regenerate for an existing run with
+   `uv run python codeout.py <run_root>/<problem>/<harness>`.
+
 A `summary.json` is written at the run root. Correctness is **not** graded.
+
+**Forcing the language:** set `language: c` in the config or pass `--language c`
+(CLI wins). A requirement is prepended to the prompt, and `meta.json` records
+`language_mismatch` (with a warning) if the model answers in another language.
+The harness image needs that language's toolchain for the agent to test its code
+(the claude image ships only `python3`).
 
 ### Config
 

@@ -80,14 +80,18 @@ def load_answer(harness_dir: Path) -> tuple[dict | None, str]:
 
     log_text = log_path.read_text(errors="replace")
 
-    # claude --output-format json: single JSON object on stdout, with the
-    # schema-validated reply under "structured_output".
-    stripped = log_text.strip()
-    if stripped.startswith("{"):
+    # claude --output-format json: a single-line JSON object on stdout, with the
+    # schema-validated reply under "structured_output". The container runtime
+    # may print warnings around it (stderr is merged into the log), so look at
+    # each line rather than the whole file.
+    for line in reversed(log_text.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
         try:
-            envelope = json.loads(stripped)
+            envelope = json.loads(line)
         except json.JSONDecodeError:
-            envelope = None
+            continue
         if isinstance(envelope, dict) and "structured_output" in envelope:
             return envelope["structured_output"], "output.log (structured_output)"
 
