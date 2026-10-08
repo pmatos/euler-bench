@@ -17,6 +17,21 @@ runtime: podman
 # Optional: force the solution language (also: --language on the CLI).
 # language: python
 
+# Per-language toolchains, mounted into the agent AND the verification
+# container when that language is forced (--language / `language:`). Unlike
+# harness `mounts`, these are kept for verification. Needs the host to have the
+# toolchain; a missing mount source is skipped with a warning. `env` entries
+# may be NAME (forward from host) or NAME=value.
+toolchains:
+  vow:
+    mounts:
+      - "~/.local/bin/vow:/usr/local/bin/vow:ro"
+      - "~/.local/bin/esbmc:/usr/local/bin/esbmc:ro"
+      - "~/dev/vow-lang/vow/target/release/libvow_runtime.a:/opt/vow/libvow_runtime.a:ro"
+      - "~/.claude/skills/vow:/opt/vow-skill:ro"
+    env:
+      - "VOW_RUNTIME_PATH=/opt/vow/libvow_runtime.a"
+
 # The prompt every harness receives. Placeholders filled per problem:
 #   {problem}       full problem-statement markdown (inlined here)
 #   {problem_file}  path to the statement file inside the container

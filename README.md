@@ -102,6 +102,15 @@ The images ship `build-essential` (gcc, g++, make) next to `python3`; other
 toolchains (rust, go, ...) must be added to the Dockerfiles, otherwise the agent
 cannot test its code and verification fails.
 
+**Vow:** `--language vow` is supported. Vow isn't in the images, so a
+`toolchains.vow` entry in the config (see `config.example.yaml`) bind-mounts the
+host's `vow` and `esbmc` binaries, its `libvow_runtime.a` (via `VOW_RUNTIME_PATH`) and the vow
+skill docs (`/opt/vow-skill`) into both the agent and the verification
+container, unlike harness `mounts`, which are agent-only. The prompt requires
+the agent to build with verification on (`vow build`, never `--no-verify`). The `vow`
+binary needs glibc ≥ 2.39, so the claude/codex images use a Debian trixie base.
+Rebuild them after pulling this change. Adjust the mount paths to where vow lives on your machine.
+
 ### Config
 
 See [`config.example.yaml`](config.example.yaml). Shape:

@@ -55,6 +55,8 @@ class Harness:
     timeout: float | None = None
     verify_timeout: float | None = DEFAULT_VERIFY_TIMEOUT
     network: str | None = None
+    tool_env: list[str] = field(default_factory=list)
+    tool_mounts: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -63,6 +65,7 @@ class Config:
     harnesses: list[Harness]
     runtime: str = "docker"
     language: str | None = None
+    toolchains: dict[str, dict[str, list[str]]] = field(default_factory=dict)
 
 
 def _as_list(value, what: str) -> list[str]:
@@ -95,6 +98,18 @@ def load_config(path: Path) -> Config:
     language = raw.get("language")
     if language is not None and (not isinstance(language, str) or not language.strip()):
         die("'language' must be a non-empty string (e.g. python, c, rust)")
+
+    toolchains: dict[str, dict[str, list[str]]] = {}
+    toolchains_raw = raw.get("toolchains") or {}
+    if not isinstance(toolchains_raw, dict):
+        die("'toolchains' must be a mapping of language -> {mounts, env}")
+    for lang, tc in toolchains_raw.items():
+        if not isinstance(tc, dict):
+            die(f"toolchains.{lang} must be a mapping")
+        toolchains[canonical_language(str(lang))] = {
+            "mounts": _as_list(tc.get("mounts"), f"toolchains.{lang}.mounts"),
+            "env": _as_list(tc.get("env"), f"toolchains.{lang}.env"),
+        }
 
     defaults = raw.get("defaults") or {}
     if not isinstance(defaults, dict):
@@ -155,7 +170,8 @@ def load_config(path: Path) -> Config:
             )
         )
 
-    return Config(prompt=prompt, harnesses=harnesses, runtime=runtime, language=language)
+    return Config(prompt=prompt, harnesses=harnesses, runtime=runtime, language=language,
+                  toolchains=toolchains)
 
 
 # --------------------------------------------------------------------------- #
@@ -193,6 +209,19 @@ def resolve_problem(arg: str) -> Problem:
 # Prompt + work dir
 # --------------------------------------------------------------------------- #
 
+LANGUAGE_NOTES = {
+    "vow": (
+        "Vow toolchain notes: the `vow` compiler and ESBMC are on PATH. Reference docs are in "
+        "/opt/vow-skill (start with SKILL.md, then reference/grammar.md, reference/stdlib.md and "
+        "reference/contracts.md). The program MUST be built with verification enabled: use "
+        "`vow build -o <exe> <file>.vow` and never pass `--no-verify`. The build must report "
+        "status \"Verified\" (fix counterexamples and skipped functions by correcting the code or "
+        "strengthening contracts, never by weakening contracts to be trivial), then run the "
+        "executable; it must print the answer on stdout.\n"
+    ),
+}
+
+
 def compose_prompt(template: str, problem: Problem, language: str | None = None) -> str:
     """Fill the config prompt template with problem-specific values.
 
@@ -212,8 +241,10 @@ def compose_prompt(template: str, problem: Problem, language: str | None = None)
     for token, value in replacements.items():
         out = out.replace(token, value)
     if language:
+        notes = LANGUAGE_NOTES.get(canonical_language(language), "")
         out = (f"You MUST write the solution in {language}. Use no other language, and set "
-               f"the \"language\" field of your final answer to \"{language}\".\n\n") + out
+               f"the \"language\" field of your final answer to \"{language}\".\n"
+               f"{notes}\n") + out
     return out
 
 
@@ -274,14 +305,17 @@ def build_run_argv(runtime: str, harness: Harness, host_work: Path, container_na
     if harness.network:
         argv += ["--network", harness.network]
     forwarded = []
-    for var in harness.env:
-        if var in os.environ:
+    for var in harness.env + harness.tool_env:
+        if "=" in var:
+            argv += ["-e", var]
+            forwarded.append(var.split("=", 1)[0])
+        elif var in os.environ:
             argv += ["-e", var]
             forwarded.append(var)
         else:
             print(f"solve: warning: env var '{var}' not set on host; not forwarded to "
                   f"'{harness.name}'", file=sys.stderr)
-    for spec in harness.mounts:
+    for spec in harness.mounts + harness.tool_mounts:
         host, container, mode = parse_mount(spec)
         if not os.path.exists(host):
             print(f"solve: warning: mount source '{host}' does not exist; "
@@ -441,6 +475,14 @@ def run_one(problem: Problem, harness: Harness, run_root: Path, cfg: Config,
         mismatch = canonical_language(answer["language"]) != canonical_language(cfg.language)
     meta["language"] = answer["language"] if answer else None
     meta["language_mismatch"] = mismatch
+    bypassed = (cfg.language is not None and canonical_language(cfg.language) == "vow"
+                and answer is not None
+                and any("--no-verify" in c for c in answer["commands"]))
+    meta["verification_bypassed"] = bypassed
+    if bypassed:
+        meta["success"] = False
+        print(f"{label} warning: vow build used --no-verify; marking run as failed",
+              file=sys.stderr)
     (base / "meta.json").write_text(json.dumps(meta, indent=2))
     print(f"{label} {'SUCCESS' if meta['success'] else 'FAILED'}")
     if mismatch:
@@ -479,6 +521,12 @@ def main(argv: list[str]) -> int:
     cfg = load_config(args.config)
     cfg.runtime = resolve_runtime(args.runtime, cfg)
     cfg.language = args.language or cfg.language
+    if cfg.language:
+        tc = cfg.toolchains.get(canonical_language(cfg.language))
+        if tc:
+            for h in cfg.harnesses:
+                h.tool_mounts += tc["mounts"]
+                h.tool_env += tc["env"]
 
     if not args.dry_run and shutil.which(cfg.runtime) is None:
         die(f"{cfg.runtime} not found on PATH (use --dry-run to inspect commands)")
