@@ -18,11 +18,20 @@ runtime: podman
 #   {problem}       full problem-statement markdown (inlined here)
 #   {problem_file}  path to the statement file inside the container
 #   {assets_dir}    path to the assets dir inside the container
+#
+# The final answer is requested as JSON matching schemas/answer.schema.json
+# ({language, answer, code}) so results are comparable across harnesses/models
+# without depending on file-writing conventions. claude/codex can enforce this
+# on the model's reply (see the claude/codex entries below); harnesses without
+# a schema flag (e.g. oh-my-pi) rely on the model following these instructions.
 prompt: |
   Solve the following Project Euler problem. Any referenced data files are in
   the assets/ directory next to you (paths in the statement are relative).
-  Write your solution code and the final answer to answer.txt in the current
-  directory, with the numeric answer on the last line.
+
+  Your final answer must be a JSON object with exactly these fields:
+    "language": the programming language of your solution (e.g. "python")
+    "answer":   the final numeric answer, as a string
+    "code":     the complete, self-contained solution source code
 
   ---
   {problem}
@@ -47,20 +56,33 @@ harnesses:
 
   - name: claude
     image: euler-harness/claude:latest
-    cmd: "claude -p {prompt} --dangerously-skip-permissions"
+    # --json-schema forces the model's final reply to match
+    # schemas/answer.schema.json; with --output-format json it comes back as
+    # the `structured_output` field of the single JSON object on stdout.
+    cmd: |
+      claude -p {prompt} --dangerously-skip-permissions --output-format json --json-schema '{"type":"object","properties":{"language":{"type":"string"},"answer":{"type":"string"},"code":{"type":"string"}},"required":["language","answer","code"],"additionalProperties":false}'
     mounts:
       - "~/.claude:/root/.claude"
       - "~/.claude.json:/root/.claude.json"
 
   - name: codex
     image: euler-harness/codex:latest
-    cmd: "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox {prompt}"
+    # --output-schema enforces the same schema; -o writes the validated final
+    # message straight to a file in /work (no stdout parsing needed).
+    cmd: |
+      codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --output-schema /root/schema.json -o {workdir}/result.json {prompt}
     mounts:
       - "~/.codex/auth.json:/root/.codex/auth.json"
+      - "schemas/answer.schema.json:/root/schema.json:ro"
       # - "~/.codex/config.toml:/root/.codex/config.toml:ro"  # host config.toml may reference host paths/MCP servers
 
   - name: oh-my-pi
     image: euler-harness/oh-my-pi:latest
+    # omp has no --json-schema/--output-schema equivalent (only --mode=json,
+    # which streams internal events, not a schema-validated final answer), so
+    # unlike the claude/codex harnesses this one can't enforce
+    # schemas/answer.schema.json — it relies on prompt wording alone, and
+    # compare.py falls back to best-effort parsing of its answer.txt.
     cmd: "omp -p {prompt} --auto-approve --no-session"
     mounts:
       - "~/.omp:/root/.omp"
