@@ -7,7 +7,7 @@
 #   podman build -t euler-harness/claude:latest harnesses/claude
 # Pin a different CLI version:
 #   podman build --build-arg CLAUDE_VERSION=2.1.206 -t euler-harness/claude:latest harnesses/claude
-FROM docker.io/library/node:22-bookworm-slim
+FROM docker.io/library/node:22-trixie-slim
 
 ARG CLAUDE_VERSION=2.1.206
 RUN apt-get update \

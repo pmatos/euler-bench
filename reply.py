@@ -136,7 +136,7 @@ ALIASES = {
 
 
 KNOWN = {"python", "c", "c++", "rust", "go", "java", "javascript", "typescript", "ruby",
-         "haskell", "julia", "lua", "bash", "kotlin", "swift", "scala", "ocaml"}
+         "haskell", "julia", "lua", "bash", "kotlin", "swift", "scala", "ocaml", "vow"}
 
 
 def canonical_language(name: str) -> str:

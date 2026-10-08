@@ -5,7 +5,7 @@
 #
 # Build:
 #   podman build -t euler-harness/codex:latest harnesses/codex
-FROM docker.io/library/node:22-bookworm-slim
+FROM docker.io/library/node:22-trixie-slim
 
 ARG CODEX_VERSION=0.144.1
 RUN apt-get update \
