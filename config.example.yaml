@@ -14,24 +14,39 @@
 # daemon/group setup and writes output files back owned by you.
 runtime: podman
 
+# Optional: force the solution language (also: --language on the CLI).
+# language: python
+
 # The prompt every harness receives. Placeholders filled per problem:
 #   {problem}       full problem-statement markdown (inlined here)
 #   {problem_file}  path to the statement file inside the container
 #   {assets_dir}    path to the assets dir inside the container
 #
-# The final answer is requested as JSON matching schemas/answer.schema.json
-# ({language, answer, code}) so results are comparable across harnesses/models
-# without depending on file-writing conventions. claude/codex can enforce this
+# The final answer is requested as JSON matching schemas/solution.schema.json
+# ({language, commands}): the agent writes its code in /work and replies with the
+# shell commands that build and run it. `solve` re-runs those commands in a
+# fresh container; the run succeeds if they exit 0. claude/codex can enforce this
 # on the model's reply (see the claude/codex entries below); harnesses without
 # a schema flag (e.g. oh-my-pi) rely on the model following these instructions.
 prompt: |
-  Solve the following Project Euler problem. Any referenced data files are in
-  the assets/ directory next to you (paths in the statement are relative).
+  Solve the following Project Euler problem by writing a program.
 
-  Your final answer must be a JSON object with exactly these fields:
-    "language": the programming language of your solution (e.g. "python")
-    "answer":   the final numeric answer, as a string
-    "code":     the complete, self-contained solution source code
+  Write all of your solution files (source, build files, helper scripts) in the
+  current directory (/work). It can be a single file or a multi-file project.
+  Any data files the statement refers to are in the assets/ directory next to
+  you (paths in the statement are relative). The program must compute the
+  answer; do not hardcode it.
+
+  Your final reply must be a JSON object with exactly these fields:
+    "language": the main programming language of your solution (e.g. "python")
+    "commands": an ordered list of shell commands that build (if needed) and run
+                your solution. They are executed from /work, one script under
+                `bash -e`, in a fresh container with the same toolchain you
+                have. The last line the final command prints to stdout must be
+                the answer.
+
+  Your solution counts as successful only if these commands complete with exit
+  status 0, so run them yourself before replying.
 
   ---
   {problem}
@@ -40,6 +55,7 @@ prompt: |
 # concatenate for the env / mounts / docker_args lists).
 defaults:
   timeout: 1800        # seconds per run; omit or set null for no limit
+  # verify_timeout: 600   # seconds for the verification commands
   # No `network:` key -> the runtime's default network (with internet). The
   # harnesses need to reach their model APIs, so do NOT set network: none here.
   # SELinux hosts: append ",Z" to each mount mode, e.g. ...:/root/.claude:rw,Z
@@ -57,10 +73,10 @@ harnesses:
   - name: claude
     image: euler-harness/claude:latest
     # --json-schema forces the model's final reply to match
-    # schemas/answer.schema.json; with --output-format json it comes back as
+    # schemas/solution.schema.json; with --output-format json it comes back as
     # the `structured_output` field of the single JSON object on stdout.
     cmd: |
-      claude -p {prompt} --dangerously-skip-permissions --output-format json --json-schema '{"type":"object","properties":{"language":{"type":"string"},"answer":{"type":"string"},"code":{"type":"string"}},"required":["language","answer","code"],"additionalProperties":false}'
+      claude -p {prompt} --dangerously-skip-permissions --output-format json --json-schema '{"type":"object","properties":{"language":{"type":"string"},"commands":{"type":"array","items":{"type":"string"}}},"required":["language","commands"],"additionalProperties":false}'
     mounts:
       - "~/.claude:/root/.claude"
       - "~/.claude.json:/root/.claude.json"
@@ -73,7 +89,7 @@ harnesses:
       codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --output-schema /root/schema.json -o {workdir}/result.json {prompt}
     mounts:
       - "~/.codex/auth.json:/root/.codex/auth.json"
-      - "schemas/answer.schema.json:/root/schema.json:ro"
+      - "schemas/solution.schema.json:/root/schema.json:ro"
       # - "~/.codex/config.toml:/root/.codex/config.toml:ro"  # host config.toml may reference host paths/MCP servers
 
   - name: oh-my-pi
@@ -81,8 +97,8 @@ harnesses:
     # omp has no --json-schema/--output-schema equivalent (only --mode=json,
     # which streams internal events, not a schema-validated final answer), so
     # unlike the claude/codex harnesses this one can't enforce
-    # schemas/answer.schema.json — it relies on prompt wording alone, and
-    # compare.py falls back to best-effort parsing of its answer.txt.
+    # schemas/solution.schema.json — it relies on prompt wording alone, and
+    # compare.py falls back to best-effort parsing of a trailing JSON object.
     cmd: "omp -p {prompt} --auto-approve --no-session"
     mounts:
       - "~/.omp:/root/.omp"

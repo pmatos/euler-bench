@@ -11,7 +11,7 @@ ARG OMP_VERSION=16.3.15
 USER root
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      git ripgrep ca-certificates python3 \
+      git ripgrep ca-certificates python3 build-essential \
  && rm -rf /var/lib/apt/lists/* \
  && bun install -g @oh-my-pi/pi-coding-agent@${OMP_VERSION}
 

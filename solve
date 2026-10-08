@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import dataclasses
 import json
 import os
 import re
@@ -27,7 +28,11 @@ from pathlib import Path
 
 import yaml
 
+from codeout import write_code_dir
+from reply import canonical_language, load_valid_answer
+
 CONTAINER_WORKDIR = "/work"
+DEFAULT_VERIFY_TIMEOUT = 600
 
 
 def die(msg: str) -> "NoReturn":  # type: ignore[name-defined]
@@ -48,6 +53,7 @@ class Harness:
     mounts: list[str] = field(default_factory=list)
     docker_args: list[str] = field(default_factory=list)
     timeout: float | None = None
+    verify_timeout: float | None = DEFAULT_VERIFY_TIMEOUT
     network: str | None = None
 
 
@@ -56,6 +62,7 @@ class Config:
     prompt: str
     harnesses: list[Harness]
     runtime: str = "docker"
+    language: str | None = None
 
 
 def _as_list(value, what: str) -> list[str]:
@@ -84,6 +91,10 @@ def load_config(path: Path) -> Config:
     runtime = raw.get("runtime", "docker")
     if not isinstance(runtime, str) or not runtime.strip():
         die("'runtime' must be a string (e.g. docker or podman)")
+
+    language = raw.get("language")
+    if language is not None and (not isinstance(language, str) or not language.strip()):
+        die("'language' must be a non-empty string (e.g. python, c, rust)")
 
     defaults = raw.get("defaults") or {}
     if not isinstance(defaults, dict):
@@ -115,6 +126,9 @@ def load_config(path: Path) -> Config:
         timeout = h.get("timeout", defaults.get("timeout"))
         if timeout is not None and not isinstance(timeout, (int, float)):
             die(f"harness '{name}': timeout must be a number of seconds")
+        verify_timeout = h.get("verify_timeout", defaults.get("verify_timeout", DEFAULT_VERIFY_TIMEOUT))
+        if verify_timeout is not None and not isinstance(verify_timeout, (int, float)):
+            die(f"harness '{name}': verify_timeout must be a number of seconds")
         network = h.get("network", defaults.get("network"))
         if network is not None and not isinstance(network, str):
             die(f"harness '{name}': network must be a string")
@@ -136,11 +150,12 @@ def load_config(path: Path) -> Config:
                 mounts=list(dict.fromkeys(mounts)),
                 docker_args=docker_args,
                 timeout=float(timeout) if timeout else None,
+                verify_timeout=float(verify_timeout) if verify_timeout else None,
                 network=network,
             )
         )
 
-    return Config(prompt=prompt, harnesses=harnesses, runtime=runtime)
+    return Config(prompt=prompt, harnesses=harnesses, runtime=runtime, language=language)
 
 
 # --------------------------------------------------------------------------- #
@@ -178,12 +193,14 @@ def resolve_problem(arg: str) -> Problem:
 # Prompt + work dir
 # --------------------------------------------------------------------------- #
 
-def compose_prompt(template: str, problem: Problem) -> str:
+def compose_prompt(template: str, problem: Problem, language: str | None = None) -> str:
     """Fill the config prompt template with problem-specific values.
 
     {problem}       -> full problem-statement markdown
     {problem_file}  -> path to the statement inside the container
     {assets_dir}    -> path to the assets dir inside the container
+
+    When `language` is set, a requirement to use it is prepended.
     """
     container_md = f"{CONTAINER_WORKDIR}/{problem.md.name}"
     replacements = {
@@ -194,6 +211,9 @@ def compose_prompt(template: str, problem: Problem) -> str:
     out = template
     for token, value in replacements.items():
         out = out.replace(token, value)
+    if language:
+        out = (f"You MUST write the solution in {language}. Use no other language, and set "
+               f"the \"language\" field of your final answer to \"{language}\".\n\n") + out
     return out
 
 
@@ -279,6 +299,52 @@ def resolve_runtime(cli_runtime: str | None, cfg: Config) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Verification
+# --------------------------------------------------------------------------- #
+
+def kill_container(runtime: str, name: str) -> None:
+    subprocess.run([runtime, "rm", "-f", name],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def verify_commands(runtime: str, harness: Harness, work: Path, container_name: str,
+                    commands: list[str], log_path: Path) -> dict:
+    """Run the agent's commands in a fresh container of the harness image.
+
+    The run succeeds when the script exits 0; `answer` is the last non-empty
+    stdout line.
+    """
+    bare = dataclasses.replace(harness, env=[], mounts=[])
+    argv, _ = build_run_argv(runtime, bare, work, container_name,
+                             ["bash", "-ec", "\n".join(commands)])
+
+    started = time.time()
+    timed_out = False
+    try:
+        proc = subprocess.run(argv, capture_output=True, timeout=harness.verify_timeout)
+        exit_code, out, err = proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired as exc:
+        timed_out, exit_code, out, err = True, None, exc.stdout or b"", exc.stderr or b""
+        kill_container(runtime, container_name)
+    out_text = out.decode(errors="replace")
+    err_text = err.decode(errors="replace")
+    log = f"{out_text}\n--- stderr ---\n{err_text}"
+    if timed_out:
+        log += f"\nsolve: killed after verify timeout of {harness.verify_timeout}s\n"
+    log_path.write_text(log)
+
+    lines = [ln.strip() for ln in out_text.splitlines() if ln.strip()]
+    return {
+        "commands": commands,
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "duration_sec": round(time.time() - started, 3),
+        "answer": lines[-1] if lines and exit_code == 0 else None,
+        "log": str(log_path),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Run
 # --------------------------------------------------------------------------- #
 
@@ -286,7 +352,7 @@ def run_one(problem: Problem, harness: Harness, run_root: Path, cfg: Config,
             dry_run: bool) -> dict:
     base = run_root / problem.name / harness.name
     work = base / "work"
-    prompt_text = compose_prompt(cfg.prompt, problem)
+    prompt_text = compose_prompt(cfg.prompt, problem, cfg.language)
     prepare_workdir(work, problem, prompt_text)
 
     cmd_argv = render_cmd(harness.cmd, prompt_text, problem)
@@ -307,6 +373,7 @@ def run_one(problem: Problem, harness: Harness, run_root: Path, cfg: Config,
         "problem_file": f"{CONTAINER_WORKDIR}/{problem.md.name}",
         "timeout": harness.timeout,
         "network": harness.network,
+        "forced_language": cfg.language,
     }
 
     label = f"[{problem.name} / {harness.name}]"
@@ -333,8 +400,7 @@ def run_one(problem: Problem, harness: Harness, run_root: Path, cfg: Config,
         except subprocess.TimeoutExpired:
             timed_out = True
             exit_code = None
-            subprocess.run([cfg.runtime, "rm", "-f", container_name],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            kill_container(cfg.runtime, container_name)
             log.write(f"\n\nsolve: killed after timeout of {harness.timeout}s\n".encode())
         except FileNotFoundError:
             die(f"{cfg.runtime} not found on PATH")
@@ -344,10 +410,42 @@ def run_one(problem: Problem, harness: Harness, run_root: Path, cfg: Config,
     meta["duration_sec"] = round(finished - started, 3)
     meta["exit_code"] = exit_code
     meta["timed_out"] = timed_out
-    (base / "meta.json").write_text(json.dumps(meta, indent=2))
 
     status = "TIMEOUT" if timed_out else ("ok" if exit_code == 0 else f"exit {exit_code}")
-    print(f"{label} done in {meta['duration_sec']}s: {status}")
+    print(f"{label} agent done in {meta['duration_sec']}s: {status}")
+
+    answer, note = load_valid_answer(base)
+    verify = None
+    code_dir = None
+    meta["error"] = None
+    if answer is None:
+        print(f"{label} no runnable reply ({note})")
+    else:
+        try:
+            verify = verify_commands(cfg.runtime, harness, work, container_name + "-verify",
+                                     answer["commands"], base / "verify.log")
+            print(f"{label} verify: "
+                  + ("TIMEOUT" if verify["timed_out"] else f"exit {verify['exit_code']}")
+                  + f" in {verify['duration_sec']}s, answer: {verify['answer']}")
+            code_dir = write_code_dir(base, answer, verify)
+            print(f"{label} code: {code_dir}")
+        except Exception as exc:  # keep going so meta.json and the other runs survive
+            meta["error"] = f"{type(exc).__name__}: {exc}"
+            print(f"{label} error during verification/code collection: {meta['error']}",
+                  file=sys.stderr)
+    meta["verify"] = verify
+    meta["success"] = exit_code == 0 and verify is not None and bool(verify["answer"])
+    meta["code_dir"] = str(code_dir) if code_dir else None
+    mismatch = False
+    if cfg.language and answer is not None:
+        mismatch = canonical_language(answer["language"]) != canonical_language(cfg.language)
+    meta["language"] = answer["language"] if answer else None
+    meta["language_mismatch"] = mismatch
+    (base / "meta.json").write_text(json.dumps(meta, indent=2))
+    print(f"{label} {'SUCCESS' if meta['success'] else 'FAILED'}")
+    if mismatch:
+        print(f"{label} warning: asked for {cfg.language}, got {answer['language']}",
+              file=sys.stderr)
     return meta
 
 
@@ -363,6 +461,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--runtime", metavar="BIN",
                         help="container runtime, e.g. docker or podman "
                              "(overrides config 'runtime'; default: docker)")
+    parser.add_argument("--language", metavar="LANG",
+                        help="force the solution language, e.g. python, c, c++, rust "
+                             "(overrides config 'language'; default: model's choice)")
     parser.add_argument("--runs-dir", type=Path, default=Path("runs"),
                         help="root directory for run outputs (default: ./runs)")
     parser.add_argument("--jobs", "-j", type=int, default=1,
@@ -377,6 +478,7 @@ def main(argv: list[str]) -> int:
 
     cfg = load_config(args.config)
     cfg.runtime = resolve_runtime(args.runtime, cfg)
+    cfg.language = args.language or cfg.language
 
     if not args.dry_run and shutil.which(cfg.runtime) is None:
         die(f"{cfg.runtime} not found on PATH (use --dry-run to inspect commands)")
@@ -397,6 +499,7 @@ def main(argv: list[str]) -> int:
     run_root.mkdir(parents=True, exist_ok=True)
     print(f"Run root: {run_root}")
     print(f"Runtime: {cfg.runtime}")
+    print(f"Language: {cfg.language or '(model choice)'}")
     print(f"Problems: {', '.join(p.name for p in problems)}")
     print(f"Harnesses: {', '.join(h.name for h in harnesses)}\n")
 
@@ -412,10 +515,11 @@ def main(argv: list[str]) -> int:
             results.append(run_one(p, h, run_root, cfg, args.dry_run))
 
     if not args.dry_run:
-        ok = sum(1 for r in results if r.get("exit_code") == 0)
+        ok = sum(1 for r in results if r.get("success"))
         summary = {"run_root": str(run_root), "total": len(results), "ok": ok, "results": results}
         (run_root / "summary.json").write_text(json.dumps(summary, indent=2))
-        print(f"\nSummary: {ok}/{len(results)} runs exited 0  ->  {run_root}/summary.json")
+        print(f"\nSummary: {ok}/{len(results)} runs succeeded (agent exit 0 and its run "
+              f"commands exit 0)  ->  {run_root}/summary.json")
 
     return 0
 

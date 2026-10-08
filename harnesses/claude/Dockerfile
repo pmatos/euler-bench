@@ -12,7 +12,7 @@ FROM docker.io/library/node:22-bookworm-slim
 ARG CLAUDE_VERSION=2.1.206
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      git ripgrep ca-certificates python3 curl \
+      git ripgrep ca-certificates python3 curl build-essential \
  && rm -rf /var/lib/apt/lists/* \
  && npm install -g @anthropic-ai/claude-code@${CLAUDE_VERSION}
 
