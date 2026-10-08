@@ -417,20 +417,28 @@ def run_one(problem: Problem, harness: Harness, run_root: Path, cfg: Config,
         note = f"invalid reply: {'; '.join(validate(answer))}"
         answer = None
     verify = None
-    if answer is not None:
-        verify = verify_commands(cfg.runtime, harness, work, container_name + "-verify",
-                                 answer["commands"], base / "verify.log")
-        print(f"{label} verify: " + ("TIMEOUT" if verify["timed_out"] else f"exit {verify['exit_code']}")
-              + f" in {verify['duration_sec']}s, answer: {verify['answer']}")
-    else:
+    code_dir = None
+    meta["error"] = None
+    if answer is None:
         print(f"{label} no runnable reply ({note})")
+    else:
+        try:
+            verify = verify_commands(cfg.runtime, harness, work, container_name + "-verify",
+                                     answer["commands"], base / "verify.log")
+            print(f"{label} verify: "
+                  + ("TIMEOUT" if verify["timed_out"] else f"exit {verify['exit_code']}")
+                  + f" in {verify['duration_sec']}s, answer: {verify['answer']}")
+            code_dir, _, _ = write_code_dir(base, verify)
+            if code_dir:
+                print(f"{label} code: {code_dir}")
+        except Exception as exc:  # keep going so meta.json and the other runs survive
+            meta["error"] = f"{type(exc).__name__}: {exc}"
+            print(f"{label} error during verification/code collection: {meta['error']}",
+                  file=sys.stderr)
     meta["verify"] = verify
-    meta["success"] = exit_code == 0 and verify is not None and verify["exit_code"] == 0
-
-    code_dir, _, _ = write_code_dir(base, verify) if answer is not None else (None, None, "")
+    meta["success"] = (exit_code == 0 and verify is not None and verify["exit_code"] == 0
+                       and bool(verify["answer"]))
     meta["code_dir"] = str(code_dir) if code_dir else None
-    if code_dir:
-        print(f"{label} code: {code_dir}")
     mismatch = False
     if cfg.language and answer is not None:
         mismatch = canonical_language(answer["language"]) != canonical_language(cfg.language)

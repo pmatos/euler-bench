@@ -85,13 +85,13 @@ For every `(problem × harness)` pair, `solve`:
    printed to stdout is recorded as the answer. Timeout: `verify_timeout`
    (default 600s).
 7. Collects `<harness>/code/`: the agent's files (minus `PROMPT.txt` and the
-   statement), `assets/`, `run.sh`, `solution.json` and a `README.md` with the
+   statement), `assets/`, `solve-run.sh`, `solve-reply.json` and a `README.md` with the
    commands. Regenerate for an existing run with
    `uv run python codeout.py <run_root>/<problem>/<harness>`.
 
 **A run succeeds** when the agent exits 0 *and* the verification commands exit 0
-(`success` in `meta.json`, counted in `summary.json`). The answer is not
-checked for correctness. Verification runs in the work dir as the agent left it,
+(`success` in `meta.json`, counted in `summary.json`) and printed something on
+stdout. The answer is not checked for correctness. Verification runs in the work dir as the agent left it,
 so leftover build artifacts can mask a missing build step. Use
 `compare.py <run_root>/<problem>` to see all harnesses side by side.
 
