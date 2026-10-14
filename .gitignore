@@ -9,3 +9,4 @@ uv.lock
 # personal harness configs
 /config.yaml
 /haiku-only.yaml
+/all-models.yaml

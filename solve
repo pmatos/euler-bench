@@ -29,6 +29,7 @@ from pathlib import Path
 import yaml
 
 from codeout import write_code_dir
+from models import MODELS, check_effort
 from reply import canonical_language, load_valid_answer
 
 CONTAINER_WORKDIR = "/work"
@@ -57,6 +58,8 @@ class Harness:
     network: str | None = None
     tool_env: list[str] = field(default_factory=list)
     tool_mounts: list[str] = field(default_factory=list)
+    model: str | None = None
+    effort: str | None = None
 
 
 @dataclass
@@ -137,6 +140,19 @@ def load_config(path: Path) -> Config:
         if not isinstance(cmd, str) or not cmd.strip():
             die(f"harness '{name}' must have a non-empty string 'cmd'")
 
+        model = h.get("model")
+        if model is not None and not isinstance(model, str):
+            die(f"harness '{name}': model must be a string")
+        effort = h.get("effort")
+        if effort is not None and not isinstance(effort, str):
+            die(f"harness '{name}': effort must be a string")
+        if model is not None:
+            err = check_effort(model, effort)
+            if err:
+                die(f"harness '{name}': {err}")
+        elif effort is not None:
+            die(f"harness '{name}': 'effort' requires 'model'")
+
         # defaults + per-harness merge: scalars override, lists concatenate.
         timeout = h.get("timeout", defaults.get("timeout"))
         if timeout is not None and not isinstance(timeout, (int, float)):
@@ -167,6 +183,8 @@ def load_config(path: Path) -> Config:
                 timeout=float(timeout) if timeout else None,
                 verify_timeout=float(verify_timeout) if verify_timeout else None,
                 network=network,
+                model=model,
+                effort=effort,
             )
         )
 
@@ -260,19 +278,28 @@ def prepare_workdir(work: Path, problem: Problem, prompt_text: str) -> None:
 # Docker command
 # --------------------------------------------------------------------------- #
 
-def render_cmd(template: str, prompt_text: str, problem: Problem) -> list[str]:
+def render_cmd(template: str, prompt_text: str, problem: Problem,
+               harness: Harness) -> list[str]:
     """shlex-split the harness cmd, then substitute placeholders per token so a
-    multi-word {prompt} stays a single argv element."""
+    multi-word {prompt} stays a single argv element. A token that is exactly
+    {effort_args} expands to `--effort <level>`, or to nothing when the model
+    has no effort levels."""
     container_md = f"{CONTAINER_WORKDIR}/{problem.md.name}"
     subs = {
         "{prompt}": prompt_text,
         "{prompt_file}": f"{CONTAINER_WORKDIR}/PROMPT.txt",
         "{problem_file}": container_md,
         "{workdir}": CONTAINER_WORKDIR,
+        "{model}": harness.model or "",
+        "{effort}": harness.effort or "",
     }
     tokens = shlex.split(template)
     rendered = []
     for tok in tokens:
+        if tok == "{effort_args}":
+            if harness.effort:
+                rendered += ["--effort", harness.effort]
+            continue
         for token, value in subs.items():
             tok = tok.replace(token, value)
         rendered.append(tok)
@@ -389,7 +416,7 @@ def run_one(problem: Problem, harness: Harness, run_root: Path, cfg: Config,
     prompt_text = compose_prompt(cfg.prompt, problem, cfg.language)
     prepare_workdir(work, problem, prompt_text)
 
-    cmd_argv = render_cmd(harness.cmd, prompt_text, problem)
+    cmd_argv = render_cmd(harness.cmd, prompt_text, problem, harness)
     container_name = sanitize_name("euler", run_root.name, problem.name, harness.name)
     run_argv, forwarded = build_run_argv(cfg.runtime, harness, work, container_name, cmd_argv)
 
@@ -397,6 +424,9 @@ def run_one(problem: Problem, harness: Harness, run_root: Path, cfg: Config,
         "problem": problem.name,
         "problem_dir": str(problem.dir),
         "harness": harness.name,
+        "model": harness.model,
+        "effort": harness.effort,
+        "effort_supported": bool(MODELS[harness.model].efforts) if harness.model else None,
         "runtime": cfg.runtime,
         "image": harness.image,
         "container_name": container_name,

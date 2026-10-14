@@ -144,6 +144,25 @@ harnesses:
 argv token), `{prompt_file}` (`/work/PROMPT.txt`), `{problem_file}`, `{workdir}`
 (`/work`).
 
+### Models and effort levels
+
+A harness may set `model` and `effort`; both are validated against
+[`models.py`](models.py) (the active Claude models and the effort levels each
+accepts) and recorded in `meta.json` (`model`, `effort`, `effort_supported`).
+Use `{model}` and `{effort_args}` in `cmd`: `{effort_args}` expands to
+`--effort <level>`, or to nothing for models with no effort parameter.
+
+| models | effort levels |
+|--------|---------------|
+| fable-5-1, fable-5, opus-5-5, opus-5, opus-4-8, opus-4-7, sonnet-5-5, sonnet-5, haiku-5-5 | low, medium, high, xhigh, max |
+| opus-4-6, sonnet-4-6 | low, medium, high, max |
+| opus-4-5 | low, medium, high |
+| haiku-4-5 | none (omit `effort`) |
+
+Models that support effort must set it explicitly: Claude Code applies its own
+default otherwise, which differs from the API default. Run several levels of one
+model as separate harnesses (e.g. `haiku-5-5-low`, `haiku-5-5-high`).
+
 ### Harness images & sharing auth
 
 You build the images; each just needs its CLI installed (`HOME=/root`,
